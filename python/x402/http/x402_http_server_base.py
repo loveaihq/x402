@@ -353,17 +353,37 @@ class x402HTTPServerBase:
         method = context.method or context.adapter.get_method()
         # _get_route_config returns tuple[RouteConfig, str] | None; 'is not None' is the
         # correct check for a union-with-None return type and does not rely on tuple truthiness.
-        return self._get_route_config(context.path, method) is not None
+        return self._get_route_config(context.path, method, context.decoded_path) is not None
 
-    def _get_route_config(self, path: str, method: str) -> tuple[RouteConfig, str] | None:
-        """Find matching route configuration, returning (config, pattern) or None."""
-        normalized_path = self._normalize_path(path)
+    def _get_route_config(
+        self, path: str, method: str, decoded_path: str | None = None
+    ) -> tuple[RouteConfig, str] | None:
+        """Find matching route configuration, returning (config, pattern) or None.
+
+        Checks the escaped path first, matching what protects wildcard/param
+        routes from being widened by a decoded separator (see
+        ``_normalize_path``). If that misses and the caller supplied a
+        ``decoded_path`` distinct from ``path`` (the framework's own routing
+        view, e.g. Starlette's ``request.url.path`` or Werkzeug's
+        ``PATH_INFO``), it is checked too, so a literal route cannot be
+        bypassed by encoding the separator the framework decodes but the
+        escaped-path check does not.
+        """
         upper_method = method.upper()
 
-        for route in self._compiled_routes:
-            if route.regex.match(normalized_path):
-                if route.verb == "*" or route.verb == upper_method:
-                    return route.config, route.pattern
+        def find_match(candidate: str) -> tuple[RouteConfig, str] | None:
+            for route in self._compiled_routes:
+                if route.regex.match(candidate):
+                    if route.verb == "*" or route.verb == upper_method:
+                        return route.config, route.pattern
+            return None
+
+        match = find_match(self._normalize_path(path))
+        if match is not None:
+            return match
+
+        if decoded_path is not None and decoded_path != path:
+            return find_match(self._normalize_decoded_path(decoded_path))
 
         return None
 
@@ -388,7 +408,7 @@ class x402HTTPServerBase:
             context = dataclasses.replace(context, method=context.adapter.get_method())
 
         # Find matching route
-        route_match = self._get_route_config(context.path, context.method)
+        route_match = self._get_route_config(context.path, context.method, context.decoded_path)
         if route_match is None:
             return HTTPProcessResult(type=RESULT_NO_PAYMENT_REQUIRED)
         route_config, route_pattern = route_match
@@ -1063,7 +1083,11 @@ class x402HTTPServerBase:
         settlement_headers = failure.headers
         if context and not context.method:
             context = dataclasses.replace(context, method=context.adapter.get_method())
-        route_match = self._get_route_config(context.path, context.method) if context else None
+        route_match = (
+            self._get_route_config(context.path, context.method, context.decoded_path)
+            if context
+            else None
+        )
         route_config = route_match[0] if route_match else None
 
         custom_body = None
@@ -1264,6 +1288,22 @@ class x402HTTPServerBase:
             normalized_segments.append(decoded)
         path = "/".join(normalized_segments)
 
+        path = re.sub(r"/+", "/", path)
+        path = path.rstrip("/")
+
+        return path or "/"
+
+    @staticmethod
+    def _normalize_decoded_path(path: str) -> str:
+        """Normalize a path the framework has already percent-decoded.
+
+        Unlike ``_normalize_path``, this does not decode percent-escapes: the
+        input already passed through exactly one decode by the framework's
+        own router (e.g. Starlette's ``request.url.path`` or Werkzeug's
+        ``PATH_INFO``), and re-decoding it could misinterpret a literal ``%``
+        left behind by an already-resolved double encoding.
+        """
+        path = path.split("?")[0].split("#")[0]
         path = re.sub(r"/+", "/", path)
         path = path.rstrip("/")
 

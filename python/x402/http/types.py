@@ -85,6 +85,12 @@ class HTTPRequestContext:
     method: str
     payment_header: str | None = None
     route_pattern: str | None = None
+    # The framework's own percent-decoded routing view of the path (e.g.
+    # Starlette's ``request.url.path`` or Werkzeug's ``PATH_INFO``), when the
+    # middleware can supply one distinct from ``path``. Route matching checks
+    # both representations so a request cannot bypass the payment gate by
+    # encoding a path separator one router decodes and the other does not.
+    decoded_path: str | None = None
 
 
 @dataclass

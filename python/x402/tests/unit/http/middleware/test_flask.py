@@ -1345,3 +1345,74 @@ class TestEncodedPathBypass:
 
     def test_unrelated_path_is_not_gated(self, client) -> None:
         assert client.get("/health").status_code == 200
+
+
+class TestLiteralRoutePercentEncodedSeparatorBypass:
+    """A literal (non-wildcard) route must stay gated when a WSGI server
+
+    reports an escaped ``RAW_URI``/``REQUEST_URI`` that diverges from the
+    decoded ``PATH_INFO`` Werkzeug actually dispatches on. Werkzeug's own test
+    client never populates ``RAW_URI``/``REQUEST_URI`` (only gunicorn/uWSGI
+    do), so ``environ_overrides`` simulates a real WSGI server: ``PATH_INFO``
+    stays decoded (Werkzeug routes to the literal handler regardless), while
+    ``RAW_URI`` carries the escaped request target.
+    """
+
+    @staticmethod
+    def _routes() -> dict[str, RouteConfig]:
+        option = PaymentOption(
+            scheme="cash",
+            pay_to="Alice",
+            price="$0.01",
+            network="x402:cash",
+        )
+        return {"GET /api/premium": RouteConfig(accepts=option)}
+
+    @staticmethod
+    def _cash_server() -> x402ResourceServerSync:
+        facilitator = x402FacilitatorSync().register(
+            ["x402:cash"],
+            CashSchemeNetworkFacilitator(),
+        )
+        server = x402ResourceServerSync(CashFacilitatorClientSync(facilitator))
+        server.register("x402:cash", CashSchemeNetworkServer())
+        server.initialize()
+        return server
+
+    @pytest.fixture()
+    def client(self):
+        app = Flask(__name__)
+        payment_middleware(
+            app,
+            self._routes(),
+            self._cash_server(),
+            sync_facilitator_on_start=False,
+        )
+
+        @app.route("/api/premium")
+        def premium() -> tuple[str, int]:
+            return "paid content", 200
+
+        return app.test_client()
+
+    def test_baseline_literal_route_returns_402(self, client) -> None:
+        assert client.get("/api/premium").status_code == 402
+
+    @pytest.mark.parametrize(
+        "raw_uri",
+        [
+            "/api%2Fpremium",
+            "/api%2fpremium",
+            "/%61pi%2Fpremium",
+        ],
+        ids=["encoded-slash", "lowercase-encoded-slash", "encoded-slash-and-letter"],
+    )
+    def test_percent_encoded_raw_uri_still_returns_402(self, client, raw_uri: str) -> None:
+        # PATH_INFO stays "/api/premium" (decoded, what Werkzeug dispatches
+        # on); RAW_URI carries the escaped request target a real WSGI server
+        # would report.
+        response = client.get("/api/premium", environ_overrides={"RAW_URI": raw_uri})
+        assert response.status_code == 402
+
+    def test_unrelated_path_is_not_gated(self, client) -> None:
+        assert client.get("/health").status_code == 404
