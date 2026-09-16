@@ -90,7 +90,6 @@ console.log(result.content);
 if (result.paymentMade && result.paymentResponse) {
   console.log("Payment settled:", result.paymentResponse.transaction);
 }
-}
 ```
 
 ## Advanced Features
