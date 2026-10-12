@@ -1,6 +1,6 @@
 # Scheme: `batch-settlement` on `Cardano`
 
-Status: **draft**, v0.10 (2026-10-09). Reference implementation and preprod measurements:
+Status: **draft**, v0.11 (2026-10-13). Reference implementation and preprod measurements:
 [loveaihq/subbit-x402](https://github.com/loveaihq/subbit-x402) (`src/x402/`, [`RESULTS.md`](https://github.com/loveaihq/subbit-x402/blob/main/RESULTS.md)).
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are to be read as in RFC 2119.
@@ -48,7 +48,7 @@ Where a name means something else here than on EVM or SVM, the table says so.
 
 | x402 (wire) | Subbit | Here |
 |---|---|---|
-| `channelId` | `tag` | the same 32 bytes, derived from an input the opening spends (*Identity and position*); on EVM, a hash of the config |
+| `channelId` | `tag` | the same 32 bytes, derived from an input the opening spends (*Identity and position*). Subbit's tag is not an identifier; this binding makes it one. On EVM, a hash of the config |
 | `channelRef` | — | the channel's current UTxO, `txHash#index`; it moves with every step that continues the channel |
 | `payer` | `consumer` | a key hash |
 | `payerAuthorizer` | `iouKey` | an Ed25519 public key, one per channel |
@@ -119,8 +119,9 @@ signature         d09aac1f109a70db6328acec3e83d01f9d894d6bab248b03e8689ac3818526
 
 IOUs carry no expiry.
 
-Each channel has its own IOU key. A client SHOULD derive it from its wallet, so that a client
-that has lost its records can make the key again from the chain (*Client verification rules*).
+A client SHOULD derive its IOU keys from its wallet, so that a client that has lost its records can
+make them again from the chain (*Client verification rules*); the reference client derives one per
+channel (*Identity and position*).
 The reference client signs, once, the message below with the wallet's payment key (CIP-8
 `signData`), takes the Ed25519 signature out of the resulting COSE_Sign1, and derives
 
@@ -145,8 +146,16 @@ at the server depends on it.
 ### Identity and position
 
 - `channelId` is the channel's `tag`, 32 bytes, lower-case hex. The client MUST derive it as
-  blake2b-256 of the CBOR of one of the inputs its opening transaction spends, and MUST use a
-  fresh `iouKey` for every channel: an IOU is bound to `(iouKey, tag)`, so the pair must be unique.
+  blake2b-256 of the CBOR of one of the inputs its opening transaction spends, Subbit's recommended
+  default, and a facilitator refuses any other. In Subbit the tag is not an identifier: it only
+  keeps a consumer's IOU from being redeemed on another of its channels under the same IOU key, a
+  risk to the consumer and never to the provider, and Subbit allows duplicates. This binding uses
+  the tag as x402's `channelId`, the key of the server's records, so it needs tags no other client
+  can claim. That is the binding's choice, a provider refusing channels it deems ill formed, not a
+  requirement of Subbit. Tags derived from spent inputs are unique, so no IOU can be redeemed on
+  another channel opened through this binding, whatever the keys. So a client MAY use one `iouKey`
+  for several channels, though a key that leaks then exposes all of them; the reference client
+  derives one per channel (*IOUs*).
 - `channelRef` is the channel's current `txHash#index`. It changes with every `Sub` and `Add`.
   Parties find the current position by following each spending transaction from any earlier one.
 
@@ -434,7 +443,7 @@ A valid response carries `extra` = `{ channelId, channelRef, balance, totalClaim
 |---|---|---|
 | `deposit` | client | re-verify, broadcast the exact bytes received, wait for the confirmation policy |
 | `refund` | server (client-originated) | add `providerWitness`, re-verify, broadcast, wait |
-| `claim` | server | check every channel input is redeemed through `Main`/`Defer` and not `Mutual`, and that `claims` lists them all; evaluate; broadcast; wait. Covers `Sub` and `Settle` alike. Without `transaction`: build and sign it with a delegated key (*Delegating the provider key*) |
+| `claim` | server | check every channel input is redeemed through `Main`/`Defer` and not `Mutual`, and that `claims` lists them all; evaluate; broadcast; wait. Covers `Sub` and `Settle` alike. Without `transaction`: build and sign it as the server's provider (*The facilitator as provider*) |
 | `voucher` | — | refused: vouchers settle on the server |
 
 ```ts
@@ -452,17 +461,19 @@ again. On preprod one deposit confirmed 2.5 minutes after submission.
 ### `GET /supported`
 
 `kinds: [{ x402Version: 2, scheme: "batch-settlement", network }]` with no `extra`. `signers` lists
-the provider keys the facilitator holds for servers (*Delegating the provider key*), and is empty
+the provider keys the facilitator holds for servers (*The facilitator as provider*), and is empty
 when it holds none.
 
-### Delegating the provider key
+### The facilitator as provider
 
-A server MAY run without the provider key: a facilitator holds it, one key per server, registered
-with that server's `payTo` and a secret the two share, and the server gives that key as
-`receiverAuthorizer`, so its channels name it as `provider`. The validator does not restrict where
-a redemption pays, so this is custody, not an authorisation: the server trusts the facilitator
-with its revenue. (EVM's contract pays the receiver whoever authorises the claim; SVM's draft does
-not delegate.)
+A server MAY run without a provider key of its own. The facilitator is then its channels' provider:
+it holds a key for the server, one per server, registered with that server's `payTo` and a secret
+the two share, and the server gives that key as `receiverAuthorizer`, so its channels name it as
+`provider`. Subbit fixes no receiver, and the provider key can send a redemption anywhere, so this
+is custody: the seller is the customer of a facilitator that runs its channels and pays it. A split
+that is not custody needs a validator that fixes the receiver in the datum and makes `Sub` and
+`Settle` pay it, as EVM's contract pays the receiver whoever authorises the claim. Subbit does not,
+and this binding has no such variant. (SVM's draft does not delegate.)
 
 - **Claims.** The server sends a `claim` without `transaction`; each entry adds the channel's
   `channelRef` and the `voucher` to redeem (`maxClaimableAmount`, `signature`). The facilitator
@@ -526,9 +537,9 @@ seen within 12 s and the settle landed 30–62 s after it, over 18 minutes befor
 **Claims.** A claim reads each channel's current position and stage, and redeems an open channel
 with `Sub` and a closed one with `Settle`, in the same batched transaction. A `Settle` costs what a
 `Sub` does and leaves the channel `Settled` for the consumer to `End`. A claim that loses a race
-with the consumer's `Close` reads the channel again and settles it. When the provider key is
-delegated, the facilitator makes these reads and builds the claim (*Delegating the provider key*);
-the server needs the chain only to audit its claims and to see them deep enough to stay.
+with the consumer's `Close` reads the channel again and settles it. When the facilitator is the
+provider, it makes these reads and builds the claim (*The facilitator as provider*); the server
+needs the chain only to audit its claims and to see them deep enough to stay.
 
 **Rollbacks.** What the server records MUST survive a rollback: its record of a channel holds the
 only copy of the latest IOU. A rolled-back claim must leave the charges claimable, and a
@@ -633,15 +644,15 @@ non-terminal `settlement_pending`.
   `Close` and `Elapse`.
 - **The server** can redeem any IOU it holds while the channel is open, and for at least the
   close period after the consumer closes; it MUST settle before `elapseAt`.
-- **The facilitator** holds no key and no funds unless a server delegates its provider key to
-  it: then it holds that server's revenue in trust (*Delegating the provider key*). Otherwise it
-  can broadcast only what the parties signed.
+- **The facilitator** holds no key and no funds unless it is a server's provider: then it holds
+  that server's revenue in custody (*The facilitator as provider*). Otherwise it can broadcast
+  only what the parties signed.
 - **The server's signature** covers a whole transaction, so the server co-signs only a refund of
   exactly the shape in *Facilitator interface*, checked by itself.
 - **A token channel's ADA** is protected only down to its exact min-UTxO, a margin of about 0.09
   tADA when the client deposits exactly the reserve.
-- **Channel identity.** A tag derived from a spent input, with a key per channel, keeps an IOU
-  from being redeemable against any channel but its own.
+- **Channel identity.** Tags derived from spent inputs are unique, so an IOU is redeemable on no
+  channel but its own, whatever the keys (*Identity and position*).
 - **Derived IOU keys** are as secret as the wallet's signature of the root message; a client MUST
   NOT sign that message for any other party.
 - **The validator** is Subbit's, alpha and unaudited. The reference implementation carries its
@@ -686,3 +697,4 @@ and `/verify` once its view is `TTL` old, settle the channels their consumers cl
 | 0.8 | 2026-10-07 | The binding names Subbit's fixed build (kompact-io/subbit-xyz#10); the earlier build stays usable |
 | 0.9 | 2026-10-09 | A server need not watch its channels: `/verify` past `TTL` and idle claims after `T` find every close in time when `TTL` + `T` stays well below the close period; a minimum for idle claims bounds what a close can cost |
 | 0.10 | 2026-10-09 | *Terms*: a table of the wire names and Subbit's, and where they differ from EVM's and SVM's; the text says IOU where it means one. The protocol is unchanged |
+| 0.11 | 2026-10-13 | The derived tag is this binding's choice, not Subbit's, and a client MAY use one IOU key for several channels; what was called delegating the provider key is described as what it is, the facilitator as provider, which is custody |
